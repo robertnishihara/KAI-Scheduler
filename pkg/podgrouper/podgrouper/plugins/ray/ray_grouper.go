@@ -79,7 +79,7 @@ func (rg *RayGrouper) getPodGroupMetadataWithClusterNamePath(
 		return nil, err
 	}
 
-	podGroupMetadata, err := rg.getPodGroupMetadataInternal(topOwner, rayClusterObj, pod)
+	podGroupMetadata, segmentedGroups, err := rg.getPodGroupMetadataInternal(topOwner, rayClusterObj, pod)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +91,12 @@ func (rg *RayGrouper) getPodGroupMetadataWithClusterNamePath(
 
 	// Only assign pod to subgroup if we're using subgroups
 	if len(podGroupMetadata.SubGroups) > 0 {
-		if err = assignRayPodToSubGroup(pod, podGroupMetadata); err != nil {
+		if err = assignRayPodToSubGroup(pod, podGroupMetadata, segmentedGroups); err != nil {
+			// A segmented worker pod that can't be placed in a segment must not be
+			// silently scheduled outside of it, so surface the error.
+			if _, isSegmented := segmentedGroups[pod.Labels[utils.RayNodeGroupLabelKey]]; isSegmented {
+				return nil, err
+			}
 			logger.V(1).Info("Failed to assign ray pod to subgroup", "pod", pod.Name, "namespace", pod.Namespace, "error", err)
 		}
 	}
@@ -99,10 +104,18 @@ func (rg *RayGrouper) getPodGroupMetadataWithClusterNamePath(
 	return podGroupMetadata, nil
 }
 
-func assignRayPodToSubGroup(pod *v1.Pod, pgMetadata *podgroup.Metadata) error {
+func assignRayPodToSubGroup(pod *v1.Pod, pgMetadata *podgroup.Metadata, segmentedGroups map[string]*segmentation) error {
 	group, found := pod.Labels[utils.RayNodeGroupLabelKey]
 	if !found {
 		return fmt.Errorf("ray node group label (%s) not found on pod %s/%s", utils.RayNodeGroupLabelKey, pod.Namespace, pod.Name)
+	}
+
+	if seg, isSegmented := segmentedGroups[group]; isSegmented {
+		segmentIndex, err := seg.podSegmentIndex(pod)
+		if err != nil {
+			return err
+		}
+		group = segmentSubGroupName(group, segmentIndex)
 	}
 
 	for _, subGroup := range pgMetadata.SubGroups {
@@ -117,24 +130,26 @@ func assignRayPodToSubGroup(pod *v1.Pod, pgMetadata *podgroup.Metadata) error {
 
 func (rg *RayGrouper) getPodGroupMetadataInternal(
 	topOwner *unstructured.Unstructured, rayClusterObj *unstructured.Unstructured, pod *v1.Pod) (
-	*podgroup.Metadata, error,
+	*podgroup.Metadata, map[string]*segmentation, error,
 ) {
 	podGroupMetadata, err := rg.DefaultGrouper.GetPodGroupMetadata(topOwner, pod)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	minReplicas, subGroups, err := calcJobNumOfPodsAndSubGroups(rayClusterObj)
+	minReplicas, subGroups, segmentedGroups, err := calcJobNumOfPodsAndSubGroups(rayClusterObj, topOwner)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	podGroupMetadata.MinAvailable = minReplicas
 	if rg.shouldUseSubGroups(podGroupMetadata.Namespace, podGroupMetadata.Name) {
 		podGroupMetadata.SubGroups = subGroups
+	} else {
+		segmentedGroups = nil
 	}
 
-	return podGroupMetadata, nil
+	return podGroupMetadata, segmentedGroups, nil
 }
 
 func (rg *RayGrouper) extractRayClusterObject(
@@ -178,11 +193,15 @@ func (rg *RayGrouper) extractRayClusterObject(
 // These calculations are based on the way KubeRay creates volcano pod-groups
 // https://github.com/ray-project/kuberay/blob/dbcc686eabefecc3b939cd5c6e7a051f2473ad34/ray-operator/controllers/ray/batchscheduler/volcano/volcano_scheduler.go#L106
 // https://github.com/ray-project/kuberay/blob/dbcc686eabefecc3b939cd5c6e7a051f2473ad34/ray-operator/controllers/ray/batchscheduler/volcano/volcano_scheduler.go#L51
-func calcJobNumOfPodsAndSubGroups(topOwner *unstructured.Unstructured) (int32, []*podgroup.SubGroupMetadata, error) {
+// Worker groups whose pod template sets kai.scheduler/segment-size are split into segment SubGroups;
+// the returned map holds the segmentation of each such group, keyed by group name.
+func calcJobNumOfPodsAndSubGroups(rayClusterObj, topOwner *unstructured.Unstructured) (
+	int32, []*podgroup.SubGroupMetadata, map[string]*segmentation, error,
+) {
 	minReplicas := int32(1)
-	headTopologyConstraints, err := getHeadGroupTopologyConstraints(topOwner)
+	headTopologyConstraints, err := getHeadGroupTopologyConstraints(rayClusterObj)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 
 	subGroups := []*podgroup.SubGroupMetadata{
@@ -193,19 +212,20 @@ func calcJobNumOfPodsAndSubGroups(topOwner *unstructured.Unstructured) (int32, [
 		},
 	}
 
-	workerGroupSpecs, workerSpecFound, err := unstructured.NestedSlice(topOwner.Object,
+	workerGroupSpecs, workerSpecFound, err := unstructured.NestedSlice(rayClusterObj.Object,
 		"spec", "workerGroupSpecs")
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	if !workerSpecFound || len(workerGroupSpecs) == 0 {
-		return minReplicas, subGroups, nil
+		return minReplicas, subGroups, nil, nil
 	}
 
+	segmentedGroups := map[string]*segmentation{}
 	for groupIndex, groupSpec := range workerGroupSpecs {
 		groupMinReplicas, groupDesiredReplicas, err := getReplicaCountersForWorkerGroup(groupSpec, groupIndex)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		if groupMinReplicas == 0 && groupDesiredReplicas == 0 {
 			continue
@@ -213,7 +233,7 @@ func calcJobNumOfPodsAndSubGroups(topOwner *unstructured.Unstructured) (int32, [
 
 		numOfHosts, err := getGroupNumOfHosts(groupSpec)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 
 		workerGroupMinReplicas := int32(groupDesiredReplicas * numOfHosts)
@@ -227,16 +247,26 @@ func calcJobNumOfPodsAndSubGroups(topOwner *unstructured.Unstructured) (int32, [
 		workerGroupName := getWorkerGroupName(groupSpec, groupIndex)
 		workerGroupTopologyConstraints, err := getWorkerGroupTopologyConstraints(groupSpec, workerGroupName)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
-		subGroups = append(subGroups, &podgroup.SubGroupMetadata{
-			Name:                workerGroupName,
-			MinAvailable:        workerGroupMinReplicas,
-			TopologyConstraints: workerGroupTopologyConstraints,
-		})
+
+		seg, err := getWorkerGroupSegmentation(groupSpec, workerGroupName, groupDesiredReplicas, numOfHosts, rayClusterObj, topOwner)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		if seg == nil {
+			subGroups = append(subGroups, &podgroup.SubGroupMetadata{
+				Name:                workerGroupName,
+				MinAvailable:        workerGroupMinReplicas,
+				TopologyConstraints: workerGroupTopologyConstraints,
+			})
+			continue
+		}
+		segmentedGroups[workerGroupName] = seg
+		subGroups = append(subGroups, seg.buildSubGroups(workerGroupName, workerGroupMinReplicas, workerGroupTopologyConstraints)...)
 	}
 
-	return minReplicas, subGroups, nil
+	return minReplicas, subGroups, segmentedGroups, nil
 }
 
 func getWorkerGroupTopologyConstraints(groupSpec interface{}, groupName string) (*podgroup.TopologyConstraintMetadata, error) {
