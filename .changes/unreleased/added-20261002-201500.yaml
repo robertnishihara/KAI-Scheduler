@@ -1,0 +1,3 @@
+kind: Added
+body: |-
+  Segment-based topology placement (`kai.scheduler/segment-size`) for Ray worker groups in RayCluster, RayJob and RayService

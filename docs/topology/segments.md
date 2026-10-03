@@ -10,7 +10,7 @@ This page is a user guide. For the full design rationale see the [design documen
 
 ## Annotations
 
-Segment annotations are placed on the **PodTemplate** of the replica that should be segmented (e.g. the `Worker` template of a `PyTorchJob`, or the `workerTemplate` of a `LeaderWorkerSet`).
+Segment annotations are placed on the **PodTemplate** of the replica that should be segmented (e.g. the `Worker` template of a `PyTorchJob`, the `workerTemplate` of a `LeaderWorkerSet`, or a worker group's `template` in a Ray workload).
 
 
 | Annotation                                           | Required                 | Description                                                                                |
@@ -48,6 +48,7 @@ So with `segment-size = 4`, pods with index 0-3 land in segment 0, pods 4-7 in s
 | ----------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PyTorchJob` (Kubeflow) | `training.kubeflow.org/replica-index`      | Segmentation applies to the `Worker` replica only.                                                                                                 |
 | `LeaderWorkerSet`       | `leaderworkerset.sigs.k8s.io/worker-index` | The leader pod has index 0; workers start at 1. Segmentation honours `subGroupPolicyType` (`LeaderWorker` or `LeaderExcluded`).                     |
+| `RayCluster`, `RayJob`, `RayService` | `ray.io/worker-group-replica-index` | Segmentation applies per worker group. For multi-host groups (`numOfHosts > 1`) the index is `replica_index * numOfHosts + ray.io/replica-host-index`. Requires KubeRay's `RayMultiHostIndexing` feature gate (on by default since KubeRay 1.6). |
 
 
 Segmentation for other workload kinds is not currently wired up. For those workloads, use a hand-written `PodGroup` with explicit subgroups as described in [Multi-Level Topology Aware Scheduling](multilevel.md).
@@ -178,6 +179,46 @@ For `LeaderExcluded` policy the leader sits in its own SubGroup outside the segm
 
 ---
 
+## Example: RayCluster — Segments per Rack
+
+A RayCluster with a worker group of 8 workers, split into 2 segments of 4 workers, each segment co-located on the same rack. The same worker group spec works inside a `RayJob` or `RayService`.
+
+```yaml
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-tp4
+  labels:
+    kai.scheduler/queue: team-a
+spec:
+  headGroupSpec:
+    template:
+      spec:
+        schedulerName: kai-scheduler
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.52.0
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 8
+      minReplicas: 8
+      template:
+        metadata:
+          annotations:
+            kai.scheduler/topology: "cluster-topology"
+            kai.scheduler/segment-size: "4"
+            kai.scheduler/segment-topology-required-placement: "cloud.provider.com/topology-rack"
+        spec:
+          schedulerName: kai-scheduler
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.52.0
+```
+
+KubeRay creates new worker pods with the lowest free replica index, so a replacement pod rejoins the segment of the pod it replaces. After a scale-down (for example by the Ray autoscaler), a surviving pod whose index is beyond the new replica count is accounted to the last segment.
+
+---
+
 ## Elasticity
 
 Segments interact naturally with elastic replicas:
@@ -196,6 +237,6 @@ This lets a job start as soon as its mandatory segments fit, while still attempt
 - **`segment-size` must be > 1 and ≤ replica count.** Other values are rejected.
 - **`LeaderExcluded` requires divisibility.** For LeaderWorkerSet, `LeaderExcluded` requires `(size - 1)` to be divisible by `subGroupSize`.
 - **Topology required.** If `kai.scheduler/topology` cannot be resolved (neither on the workload nor on the PodTemplate), segment annotations are silently ignored.
-- **Limited workload coverage.** Today only `PyTorchJob` (Worker replica) and `LeaderWorkerSet` honour these annotations. For other workloads, define segments explicitly via the `PodGroup` API — see [Multi-Level Topology Aware Scheduling](multilevel.md).
+- **Limited workload coverage.** Today only `PyTorchJob` (Worker replica), `LeaderWorkerSet` and Ray workloads (worker groups) honour these annotations. For other workloads, define segments explicitly via the `PodGroup` API — see [Multi-Level Topology Aware Scheduling](multilevel.md).
 - **Interaction with semi-preemptible.** Combining `segment-size` with `preemptibility: semi-preemptible` is allowed, but its effect depends on the emitted tree: a LeaderWorkerSet segmented tree is fully gang and has no elastic surplus, so the workload behaves as non-preemptible, while a `PyTorchJob` with `minReplicas` leaves trailing segments at `minAvailable: 0` and those pods stay elastic. See [semi-preemptible](../elastic/README.md#semi-preemptible-workloads).
 

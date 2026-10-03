@@ -191,10 +191,43 @@ func TestRaySegments_HeadPodIsNotSegmented(t *testing.T) {
 	assert.Equal(t, []string{"head"}, subGroupByName(metadata.SubGroups, utils.RayNodeHeadGroupLabelValue).PodsReferences)
 }
 
+func TestRaySegments_TopologyFromTopOwner(t *testing.T) {
+	templateAnnotations := map[string]interface{}{
+		constants.SegmentSizeKey:                      "2",
+		constants.SegmentTopologyRequiredPlacementKey: "rack",
+	}
+	rayCluster := segmentedRayCluster(nil, segmentedWorkerGroup(4, 4, templateAnnotations))
+	rayJob := &unstructured.Unstructured{Object: map[string]interface{}{
+		"kind":       "RayJob",
+		"apiVersion": "ray.io/v1",
+		"metadata": map[string]interface{}{
+			"name": "job", "namespace": "test_namespace", "uid": "2",
+			"annotations": map[string]interface{}{constants.TopologyKey: "job-topology"},
+		},
+	}}
+
+	_, subGroups, _, err := calcJobNumOfPodsAndSubGroups(rayCluster, rayJob)
+	require.NoError(t, err)
+	assert.Equal(t, "job-topology", subGroupByName(subGroups, "workers-segment-0").TopologyConstraints.Topology)
+}
+
+func TestRaySegments_PlacementWithoutTopologyIsIgnored(t *testing.T) {
+	rayCluster := segmentedRayCluster(nil, segmentedWorkerGroup(4, 4, map[string]interface{}{
+		constants.SegmentSizeKey:                      "2",
+		constants.SegmentTopologyRequiredPlacementKey: "rack",
+	}))
+	pod := rayWorkerPod("worker-0", map[string]string{utils.RayWorkerReplicaIndexKey: "0"})
+
+	metadata, err := getSegmentedMetadata(t, rayCluster, pod)
+	require.NoError(t, err)
+	segment0 := subGroupByName(metadata.SubGroups, "workers-segment-0")
+	require.NotNil(t, segment0)
+	assert.Nil(t, segment0.TopologyConstraints)
+}
+
 func TestRaySegments_Errors(t *testing.T) {
 	indexedPod := rayWorkerPod("worker-0", map[string]string{utils.RayWorkerReplicaIndexKey: "0"})
 	for name, tc := range map[string]struct {
-		clusterAnnotations  map[string]interface{}
 		templateAnnotations map[string]interface{}
 		pod                 *v1.Pod
 		errorContains       string
@@ -209,17 +242,9 @@ func TestRaySegments_Errors(t *testing.T) {
 			pod:                 indexedPod,
 			errorContains:       "must be a positive integer",
 		},
-		"segment placement without topology": {
-			templateAnnotations: map[string]interface{}{
-				constants.SegmentSizeKey:                      "2",
-				constants.SegmentTopologyRequiredPlacementKey: "rack",
-			},
-			pod:           indexedPod,
-			errorContains: "topology annotation",
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			rayCluster := segmentedRayCluster(tc.clusterAnnotations, segmentedWorkerGroup(4, 4, tc.templateAnnotations))
+			rayCluster := segmentedRayCluster(nil, segmentedWorkerGroup(4, 4, tc.templateAnnotations))
 			_, err := getSegmentedMetadata(t, rayCluster, tc.pod)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.errorContains)

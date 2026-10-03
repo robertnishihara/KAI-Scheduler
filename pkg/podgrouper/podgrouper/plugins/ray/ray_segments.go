@@ -68,29 +68,25 @@ func getWorkerGroupSegmentation(
 			groupName, numSegments, maxSegmentsPerWorkerGroup)
 	}
 
-	topologyConstraints, err := getSegmentTopologyConstraints(annotations, groupName, rayClusterObj, topOwner)
-	if err != nil {
-		return nil, err
-	}
-
 	return &segmentation{
 		size:                size,
 		numPods:             numPods,
 		numSegments:         numSegments,
 		numOfHosts:          int(numOfHosts),
-		topologyConstraints: topologyConstraints,
+		topologyConstraints: getSegmentTopologyConstraints(annotations, groupName, rayClusterObj, topOwner),
 	}, nil
 }
 
 // getSegmentTopologyConstraints reads the segment placement from the worker group's pod template. The
 // topology name may come from the pod template, the RayCluster, or the top owner (e.g. the RayJob).
+// As for other workload kinds, segment placement is ignored when no topology is set.
 func getSegmentTopologyConstraints(
 	templateAnnotations map[string]string, groupName string, owners ...*unstructured.Unstructured,
-) (*podgroup.TopologyConstraintMetadata, error) {
+) *podgroup.TopologyConstraintMetadata {
 	required := templateAnnotations[constants.SegmentTopologyRequiredPlacementKey]
 	preferred := templateAnnotations[constants.SegmentTopologyPreferredPlacementKey]
 	if required == "" && preferred == "" {
-		return nil, nil
+		return nil
 	}
 
 	topology := templateAnnotations[constants.TopologyKey]
@@ -101,15 +97,16 @@ func getSegmentTopologyConstraints(
 		topology = owner.GetAnnotations()[constants.TopologyKey]
 	}
 	if topology == "" {
-		return nil, fmt.Errorf("topology annotation (%s) is required for workerGroupSpecs.%s when segment placement annotations are set",
-			constants.TopologyKey, groupName)
+		logger.Info("Ignoring segment placement: topology annotation not set",
+			"workerGroup", groupName, "annotation", constants.TopologyKey)
+		return nil
 	}
 
 	return &podgroup.TopologyConstraintMetadata{
 		Topology:               topology,
 		RequiredTopologyLevel:  required,
 		PreferredTopologyLevel: preferred,
-	}, nil
+	}
 }
 
 // buildSubGroups returns the worker group's SubGroup, which becomes a parent, followed by one leaf
